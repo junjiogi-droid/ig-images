@@ -1,0 +1,24 @@
+name: token-check
+
+# 毎週月曜 9:00 (JST) に、Instagram トークンが使えるか・期限が近づいていないかを確認する。
+# 問題があるとこのワークフローが失敗し、GitHub から通知メールが届く（投稿はしない）。
+on:
+  schedule:
+    - cron: "0 0 * * 1" # 月曜 09:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check token
+        env:
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          TOKEN_REFRESHED_ON: ${{ vars.TOKEN_REFRESHED_ON }}
+        run: python3 check_token.py
