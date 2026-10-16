@@ -1,0 +1,55 @@
+name: daily-post
+
+# 毎日 12:00 と 20:00 (JST) に、承認済みの未投稿行を予定日時の順に1件だけ投稿する。
+# 承認済みの行が無ければ何も投稿しない。
+#
+# 段階的な運用
+#  - 定期実行は、リポジトリ変数 AUTO_POST が "true" のときだけ実際に投稿する（それ以外はドライラン）
+#  - 手動実行（Run workflow）は、publish にチェックを入れたときだけ投稿する
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 12:00 JST
+    - cron: "0 11 * * *"  # 20:00 JST
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "実際に投稿する（チェックなし = ドライラン）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # 一時ブランチの作成・削除に使う
+
+concurrency:
+  group: daily-post
+  cancel-in-progress: false # 同時に2つ動かさない（二重投稿の防止）
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+          pip install pillow
+
+      - name: Run daily post
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_SECRET: ${{ secrets.GAS_SECRET }}
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          PUBLISH: ${{ (github.event_name == 'schedule' && vars.AUTO_POST == 'true') || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            python3 daily_post.py --publish
+          else
+            python3 daily_post.py
+          fi
