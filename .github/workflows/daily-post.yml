@@ -1,6 +1,6 @@
 name: daily-post
 
-# 毎日 12:00 と 20:00 (JST) に、承認済みの未投稿行を予定日時の順に1件だけ投稿する。
+# 毎日 12:17 と 20:17 (JST) に、承認済みの未投稿行を予定日時の順に1件だけ投稿する。
 # 承認済みの行が無ければ何も投稿しない。
 #
 # 段階的な運用
@@ -8,8 +8,8 @@ name: daily-post
 #  - 手動実行（Run workflow）は、publish にチェックを入れたときだけ投稿する
 on:
   schedule:
-    - cron: "0 3 * * *"   # 12:00 JST
-    - cron: "0 11 * * *"  # 20:00 JST
+    - cron: "17 3 * * *"  # 12:17 JST（毎時0分の混雑を避けて分をずらす）
+    - cron: "17 11 * * *" # 20:17 JST
   workflow_dispatch:
     inputs:
       publish:

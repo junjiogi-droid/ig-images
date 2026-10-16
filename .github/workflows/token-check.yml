@@ -1,10 +1,10 @@
 name: token-check
 
-# 毎週月曜 9:00 (JST) に、Instagram トークンが使えるか・期限が近づいていないかを確認する。
+# 毎週月曜 9:23 (JST) に、Instagram トークンが使えるか・期限が近づいていないかを確認する。
 # 問題があるとこのワークフローが失敗し、GitHub から通知メールが届く（投稿はしない）。
 on:
   schedule:
-    - cron: "0 0 * * 1" # 月曜 09:00 JST
+    - cron: "23 0 * * 1" # 月曜 09:23 JST（毎時0分の混雑を避ける）
   workflow_dispatch:
 
 permissions:
