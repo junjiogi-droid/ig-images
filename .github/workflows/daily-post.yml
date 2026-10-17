@@ -1,15 +1,17 @@
 name: daily-post
 
-# 毎日 12:17 と 20:17 (JST) に、承認済みの未投稿行を予定日時の順に1件だけ投稿する。
-# 承認済みの行が無ければ何も投稿しない。
+# 30分おきに起動し、「いまの投稿枠で、まだ投稿していない」ときだけ、承認済みの先頭1行を投稿する。
+#  - 投稿枠: 昼=12:00〜 / 夜=20:00〜（JST）。枠に終わりはなく、次の枠が始まるまで続く
+#  - 1つの枠では1件だけ。枠を使ったかは、シートの「投稿枠」列の記録で判断する
+#  - GitHub の定期実行は遅れたり抜けたりするため、30分おきに何度も確認する。遅れても、枠が続いている間に投稿される
+#  - 承認済みの行が無ければ何も投稿しない
 #
 # 段階的な運用
-#  - 定期実行は、リポジトリ変数 AUTO_POST が "true" のときだけ実際に投稿する（それ以外はドライラン）
-#  - 手動実行（Run workflow）は、publish にチェックを入れたときだけ投稿する
+#  - 定期実行は、リポジトリ変数 AUTO_POST が "true" のときだけ動く（それ以外は何もしない）
+#  - 手動実行（Run workflow）は、publish にチェックを入れたときだけ投稿する（毎回別の枠として扱う）
 on:
   schedule:
-    - cron: "17 3 * * *"  # 12:17 JST（毎時0分の混雑を避けて分をずらす）
-    - cron: "17 11 * * *" # 20:17 JST
+    - cron: "7,37 * * * *" # 毎時07分と37分（毎時0分の混雑を避ける）
   workflow_dispatch:
     inputs:
       publish:
@@ -31,24 +33,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 入口: 投稿が必要なときだけ go=true にする（標準のPythonだけで動く軽い処理）
+      - name: Gate
+        id: gate
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_SECRET: ${{ secrets.GAS_SECRET }}
+          EVENT: ${{ github.event_name }}
+          AUTO_POST: ${{ vars.AUTO_POST }}
+        run: |
+          if [ "$EVENT" != "schedule" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"      # 手動実行は、そのまま進む
+          elif [ "$AUTO_POST" != "true" ]; then
+            echo "AUTO_POST が true ではないため、何もしません。"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            python3 daily_post.py --gate
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
         with:
           python-version: "3.12"
 
       - name: Install dependencies
+        if: steps.gate.outputs.go == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq fonts-noto-cjk
           pip install pillow
 
       - name: Run daily post
+        if: steps.gate.outputs.go == 'true'
         env:
           GAS_URL: ${{ secrets.GAS_URL }}
           GAS_SECRET: ${{ secrets.GAS_SECRET }}
           IG_TOKEN: ${{ secrets.IG_TOKEN }}
-          PUBLISH: ${{ (github.event_name == 'schedule' && vars.AUTO_POST == 'true') || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+          EVENT: ${{ github.event_name }}
+          MANUAL_PUBLISH: ${{ inputs.publish }}
         run: |
-          if [ "$PUBLISH" = "true" ]; then
+          if [ "$EVENT" = "schedule" ]; then
+            python3 daily_post.py --publish --scheduled
+          elif [ "$MANUAL_PUBLISH" = "true" ]; then
             python3 daily_post.py --publish
           else
             python3 daily_post.py

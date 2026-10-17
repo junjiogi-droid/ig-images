@@ -13,8 +13,14 @@
 失敗時は「エラー」にして止まる。「投稿中」「エラー」の行は自動では再投稿されない。
 
 使い方
-  python3 daily_post.py             # ドライラン（取得して内容を表示するだけ。状態も変えない）
-  python3 daily_post.py --publish   # 実際に投稿する
+  python3 daily_post.py                        # ドライラン（取得して内容を表示するだけ。状態も変えない）
+  python3 daily_post.py --publish              # 実際に投稿する（手動。毎回別の枠として扱う）
+  python3 daily_post.py --publish --scheduled  # 定期実行用。いまの枠（昼12:00/夜20:00）で1件だけ投稿する
+  python3 daily_post.py --gate                 # 定期実行の入口。いまの枠で投稿が必要かだけを判定する
+
+投稿枠: 昼=12:00〜、夜=20:00〜（JST）。枠に終わりはなく、次の枠が始まるまで続く。
+  1つの枠では1件しか投稿しない。枠の記録はシートの「投稿枠」列。「投稿中」「投稿済」「エラー」の
+  行に記録された枠は、使われたものとして扱う（エラーでも、同じ枠では再投稿しない）。
 
 環境変数（GitHub Secrets から渡す。値は表示しない）
   GAS_URL, GAS_SECRET … シートの受け口のURLと合言葉
@@ -24,6 +30,7 @@
 """
 import argparse
 import base64
+import datetime
 import json
 import os
 import pathlib
@@ -35,13 +42,34 @@ import urllib.error
 import urllib.request
 
 import add_ai_metadata
-import make_post
 import post_carousel
 from post_carousel import PostError
 
 MAX_TIPS = 5
 MAX_TIP_LEN = 40
 MARKER = b"trainedAlgorithmicMedia"
+
+JST = datetime.timezone(datetime.timedelta(hours=9))
+SLOT_STARTS = ((12, "昼"), (20, "夜"))  # 枠の開始時刻（JST）。枠に「終わり」はなく、次の枠が始まるまで続く
+
+
+def slot_now(now=None):
+    """いまの投稿枠の名前を返す。直近に始まった枠（12:00=昼, 20:00=夜）で、1つの枠では1件しか投稿しない。
+    例: 14:30 → その日の昼 / 22:00 → その日の夜 / 翌朝 03:00 → 前日の夜"""
+    now = (now or datetime.datetime.now(JST)).astimezone(JST)
+    if now.hour >= SLOT_STARTS[1][0]:
+        day, name = now.date(), SLOT_STARTS[1][1]
+    elif now.hour >= SLOT_STARTS[0][0]:
+        day, name = now.date(), SLOT_STARTS[0][1]
+    else:
+        day, name = now.date() - datetime.timedelta(days=1), SLOT_STARTS[1][1]
+    return f"{day.isoformat()} {name}"
+
+
+def manual_slot(now=None):
+    """手動実行用の枠。毎回ちがう名前なので、定期実行の枠を使い切ることはない。"""
+    now = (now or datetime.datetime.now(JST)).astimezone(JST)
+    return f"手動 {now:%Y-%m-%d %H:%M:%S}"
 
 
 # ---------- シートの受け口 ----------
@@ -61,11 +89,13 @@ def gas(url, secret, payload, retries=2):
     raise PostError(f"シートの受け口に接続できません: {type(last).__name__}")
 
 
-def set_status(url, secret, front_id, status, note="", claim=False):
+def set_status(url, secret, front_id, status, note="", claim=False, slot=""):
     """状態更新。完了・エラーへの更新は、すでにその状態なら成功扱い（再試行しても安全）。
     「投稿中」への更新（claim）は、すでに投稿中なら別の実行が先に取ったということなので失敗扱い。"""
-    res = gas(url, secret, {"action": "update_status", "front_id": front_id,
-                            "status": status, "note": note})
+    payload = {"action": "update_status", "front_id": front_id, "status": status, "note": note}
+    if slot:
+        payload["slot"] = slot
+    res = gas(url, secret, payload)
     if not claim and res.get("error") == "conflict" and res.get("current") == status:
         return {"ok": True, "status": status}
     return res
@@ -91,6 +121,7 @@ def validate(row):
 # ---------- 画像 ----------
 def build_images(row, tips, workdir):
     """PNG→JPEG(1080x1350)、オーダーメモ画像、AIメタデータ付与。出力先のパス3つを投稿順に返す。"""
+    import make_post  # PILが必要。判定だけの実行では読み込まない
     raw = workdir / "raw"
     out = workdir / "out"
     raw.mkdir()
@@ -165,20 +196,25 @@ def wait_public(urls, timeout=120):
 
 
 # ---------- 本体 ----------
-def run(row, args, gas_url, gas_secret, token):
+def run(row, args, gas_url, gas_secret, token, slot):
     front_id = row["front_id"]
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not repo:
         raise PostError("GITHUB_REPOSITORY がありません")
 
-    # 投稿前に「投稿中」へ更新する。成功した実行だけが続行する（二重投稿の防止）
+    # 投稿前に「投稿中」へ更新し、同時にこの枠を記録する。成功した実行だけが続行する（二重投稿の防止）。
+    # 同じ枠がすでに使われていれば、受け口が slot_taken で拒否する（確認と記録は排他制御の中で行われる）
     try:
-        claim = set_status(gas_url, gas_secret, front_id, "投稿中", "自動投稿を開始", claim=True)
+        claim = set_status(gas_url, gas_secret, front_id, "投稿中", f"自動投稿を開始（枠: {slot}）",
+                           claim=True, slot=slot)
     except PostError as e:
         print(f"「投稿中」への更新に失敗したため投稿しません: {e}")
         return 1
     if not claim.get("ok"):
-        print(f"この行は他で処理中、または対象外です（{claim.get('error')}）。何もしません。")
+        if claim.get("error") == "slot_taken":
+            print(f"この枠（{slot}）では、すでに投稿しています。何もしません。")
+        else:
+            print(f"この行は他で処理中、または対象外です（{claim.get('error')}）。何もしません。")
         return 0
 
     branch = f"tmp-{time.strftime('%Y%m%d%H%M%S')}-{front_id[:6]}"
@@ -220,22 +256,76 @@ def run(row, args, gas_url, gas_secret, token):
     return 1
 
 
+def write_output(name, value):
+    """GitHub Actions の次の手順に値を渡す（Actions の外では何もしない）。"""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{name}={value}\n")
+
+
+def gate(gas_url, gas_secret, now=None):
+    """定期実行（30分おき）の入口。いまの枠で投稿する必要があるかだけを、軽く判定する。
+    投稿する必要があるときだけ go=true を出力し、後続の準備と投稿の手順を動かす。
+    一時的な通信の失敗は何もせず終える（次の30分後に再判定）。それ以外のエラーは失敗にして気づけるようにする。"""
+    slot = slot_now(now)
+    try:
+        res = gas(gas_url, gas_secret, {"action": "list_approved", "limit": 1,
+                                        "include_images": False, "slot": slot})
+    except PostError as e:
+        print(f"[警告] 受け口に接続できませんでした。今回は何もしません（次回に再判定）: {e}")
+        write_output("go", "false")
+        return 0
+    if res.get("error") == "busy":
+        print("[警告] 受け口が混み合っています。今回は何もしません（次回に再判定）。")
+        write_output("go", "false")
+        return 0
+    if not res.get("ok"):
+        write_output("go", "false")
+        print(f"::error::シートの受け口がエラーを返しました: {res.get('error')}")
+        return 1
+    if not res.get("slot_supported"):
+        # 古い受け口は枠を無視するため、このまま進むと同じ枠で何件も投稿してしまう。必ず止める
+        write_output("go", "false")
+        print("::error::シートの受け口が「投稿枠」に対応していません。Apps Script を更新し、再デプロイしてください。")
+        return 1
+    if res.get("slot_used"):
+        print(f"この枠（{slot}）では、すでに投稿済みです。何もしません。")
+        write_output("go", "false")
+        return 0
+    if not res.get("rows"):
+        print(f"この枠（{slot}）は未投稿ですが、承認済みの未投稿行がありません。何もしません。")
+        write_output("go", "false")
+        return 0
+    print(f"この枠（{slot}）は未投稿で、承認済みの行があります。投稿に進みます。")
+    write_output("go", "true")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--publish", action="store_true", help="指定したときだけ実際に投稿する")
+    ap.add_argument("--scheduled", action="store_true",
+                    help="定期実行の枠（昼12:00/夜20:00）で投稿する。付けなければ手動の枠（毎回別名）")
+    ap.add_argument("--gate", action="store_true", help="いまの枠で投稿が必要かだけ判定する（投稿しない）")
     ap.add_argument("--user-id", default=os.environ.get("IG_USER_ID", "me"))
     args = ap.parse_args()
 
     gas_url, gas_secret = os.environ.get("GAS_URL"), os.environ.get("GAS_SECRET")
     if not gas_url or not gas_secret:
         sys.exit("GAS_URL / GAS_SECRET が設定されていません")
+    if args.gate:
+        return gate(gas_url, gas_secret)
     token = os.environ.get("IG_TOKEN")
     if args.publish and not token:
         sys.exit("IG_TOKEN が設定されていません")
 
+    slot = slot_now() if args.scheduled else manual_slot()
+    request = {"action": "list_approved", "limit": 1, "include_images": args.publish}
+    if args.publish and args.scheduled:
+        request["slot"] = slot  # 枠がすでに使われていれば、画像を読み込まずに終える
     try:
-        res = gas(gas_url, gas_secret, {"action": "list_approved", "limit": 1,
-                                        "include_images": args.publish})
+        res = gas(gas_url, gas_secret, request)
     except PostError as e:
         sys.exit(str(e))
     if not res.get("ok"):
@@ -243,6 +333,12 @@ def main():
     for s in res.get("skipped", []):
         print(f"[スキップ] {s.get('front_id', '')[:8]}…: {s.get('reason')}")
 
+    if args.publish and args.scheduled and not res.get("slot_supported"):
+        sys.exit("シートの受け口が「投稿枠」に対応していません。二重投稿を防げないため、投稿しません。"
+                 "Apps Script を更新し、再デプロイしてください。")
+    if res.get("slot_used"):
+        print(f"この枠（{slot}）では、すでに投稿しています。何も投稿しません。")
+        return 0
     rows = res.get("rows", [])
     if not rows:
         print("承認済みの未投稿行がありません。何も投稿しません。")
@@ -259,7 +355,7 @@ def main():
             print(f"内容チェック: NG … {e}")
         print("ドライラン完了（投稿も状態の更新もしていません）。")
         return 0
-    return run(row, args, gas_url, gas_secret, token)
+    return run(row, args, gas_url, gas_secret, token, slot)
 
 
 if __name__ == "__main__":
