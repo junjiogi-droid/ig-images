@@ -15,6 +15,10 @@
   - 投稿は「--publish」を付けたときだけ実行（SNS投稿は人が確認するポイント）
 
 daily_post.py からは publish_carousel() を呼ぶ（失敗は PostError）。
+  RetryLater は「まだ投稿されていない。次の実行でコンテナから作り直せばよい」失敗（再試行待ち）。
+
+API呼び出しの回数（1投稿）: コンテナ作成3 + 状態確認 最大5×3 + カルーセル作成1 + 状態確認 最大5
+  + 公開 最大3 + パーマリンク1 = 最少10回・最多28回。コンテナIDは保存せず、毎回作り直す。
 """
 import argparse
 import json
@@ -26,10 +30,39 @@ import urllib.parse
 import urllib.request
 
 BASE = "https://graph.instagram.com/v25.0"
+RATE_LIMIT_CODE = 4          # Application request limit reached（アプリ全体の呼び出し上限）
+MEDIA_NOT_READY_CODE = 9007  # Media ID is not available（公開できる状態になっていない）
+STATUS_WAITS = (10, 10, 15, 20, 30)  # 状態確認の前に待つ秒数。確認は最大5回（合計85秒）
+PUBLISH_RETRY_WAITS = (30, 60)       # 公開が 9007 のとき、この間隔で最大2回やり直す
+RATE_LIMIT_COOLDOWN_MIN = 60         # 上限に達したら、少なくともこの分数は投稿しない
 
 
 class PostError(Exception):
     """投稿処理の失敗（メッセージにトークンは含めない）"""
+
+
+class ApiError(PostError):
+    """APIがエラーを返した（code は Instagram のエラーコード。読めなければ None）"""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class RetryLater(PostError):
+    """投稿されていないことが確かな失敗。次の実行で、コンテナから作り直してやり直す（再試行待ち）。
+    cooldown_min: 0より大きければ、その分数のあいだ、どの行も投稿しない（上限はアプリ全体にかかるため）"""
+
+    def __init__(self, message, cooldown_min=0):
+        super().__init__(message)
+        self.cooldown_min = cooldown_min
+
+
+def error_code(body):
+    try:
+        return json.loads(body).get("error", {}).get("code")
+    except (ValueError, AttributeError):
+        return None
 
 
 def call(method, path, token, params=None):
@@ -47,7 +80,12 @@ def call(method, path, token, params=None):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
-        raise PostError(f"APIエラー {e.code}: {e.read().decode(errors='replace')[:600]}")
+        body = e.read().decode(errors="replace")
+        message = f"APIエラー {e.code}: {body[:600]}"
+        code = error_code(body)
+        if code == RATE_LIMIT_CODE:
+            raise RetryLater(message, cooldown_min=RATE_LIMIT_COOLDOWN_MIN)
+        raise ApiError(message, code)
     except urllib.error.URLError as e:
         raise PostError(f"通信エラー: {e.reason}")
 
@@ -70,17 +108,35 @@ def check_url(url):
         print(f"  [警告] 事前確認できませんでした（{e.reason}）: {url}")
 
 
-def wait_finished(container_id, token, timeout=120):
-    waited = 0
-    while waited <= timeout:
+def wait_finished(container_id, token):
+    """status_code が FINISHED になるまで、間隔を空けて最大 len(STATUS_WAITS) 回だけ確認する。
+    間に合わなければ、このコンテナは使わず、次の実行で作り直す。"""
+    for wait in STATUS_WAITS:
+        time.sleep(wait)
         st = call("GET", container_id, token, {"fields": "status_code"}).get("status_code")
         if st == "FINISHED":
             return
         if st in ("ERROR", "EXPIRED"):
             raise PostError(f"コンテナが {st} になりました: {container_id}")
-        time.sleep(3)
-        waited += 3
-    raise PostError(f"待機がタイムアウトしました: {container_id}")
+    raise RetryLater(f"コンテナの準備が {sum(STATUS_WAITS)} 秒で終わりませんでした: {container_id}")
+
+
+def publish(container_id, token, user_id):
+    """media_publish を呼ぶ。9007（まだ公開できない）のときだけ、間隔を空けてやり直す。
+    9007 は「公開されていない」という応答なので、やり直しても二重投稿にはならない。"""
+    for wait in (*PUBLISH_RETRY_WAITS, None):
+        try:
+            return call("POST", f"{user_id}/media_publish", token, {"creation_id": container_id})
+        except RetryLater as e:
+            # 公開の呼び出しで上限に達した。公開されたか確かめられないため、人が確認する（エラー扱い）
+            raise PostError(f"{e}（公開の呼び出しで上限に達しました）") from e
+        except ApiError as e:
+            if e.code != MEDIA_NOT_READY_CODE and "Media ID is not available" not in str(e):
+                raise
+            if wait is None:
+                raise RetryLater(f"公開できる状態になりませんでした: {e}") from e
+            print(f"  公開できる状態ではありません。{wait}秒後にやり直します")
+            time.sleep(wait)
 
 
 def publish_carousel(urls, caption, token, user_id="me", before_publish=None):
@@ -105,8 +161,7 @@ def publish_carousel(urls, caption, token, user_id="me", before_publish=None):
 
     if before_publish:
         before_publish()
-    r = call("POST", f"{user_id}/media_publish", token, {"creation_id": parent})
-    media_id = r["id"]
+    media_id = publish(parent, token, user_id)["id"]
     try:
         return call("GET", media_id, token, {"fields": "permalink"}).get("permalink", "(取得できませんでした)")
     except PostError:

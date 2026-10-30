@@ -11,6 +11,9 @@
   6. 一時ブランチを削除（成功・失敗にかかわらず）
 
 失敗時は「エラー」にして止まる。「投稿中」「エラー」の行は自動では再投稿されない。
+ただし、投稿されていないことが確かな失敗（403 code 4 の呼び出し上限、9007 の Media ID is not available、
+コンテナの準備待ちの時間切れ）は「再試行待ち」にして、次の実行でコンテナから作り直す。
+上限に達したときは、受け口に「1時間は投稿しない」と伝える（その間はどの行も対象にならない）。
 
 使い方
   python3 daily_post.py                        # ドライラン（取得して内容を表示するだけ。状態も変えない）
@@ -43,7 +46,7 @@ import urllib.request
 
 import add_ai_metadata
 import post_carousel
-from post_carousel import PostError
+from post_carousel import PostError, RetryLater
 
 MAX_TIPS = 5
 MAX_TIP_LEN = 40
@@ -89,12 +92,15 @@ def gas(url, secret, payload, retries=2):
     raise PostError(f"シートの受け口に接続できません: {type(last).__name__}")
 
 
-def set_status(url, secret, front_id, status, note="", claim=False, slot=""):
+def set_status(url, secret, front_id, status, note="", claim=False, slot="", cooldown_min=0):
     """状態更新。完了・エラーへの更新は、すでにその状態なら成功扱い（再試行しても安全）。
-    「投稿中」への更新（claim）は、すでに投稿中なら別の実行が先に取ったということなので失敗扱い。"""
+    「投稿中」への更新（claim）は、すでに投稿中なら別の実行が先に取ったということなので失敗扱い。
+    cooldown_min: 「再試行待ち」にするとき、この分数のあいだ受け口がどの行も返さないようにする。"""
     payload = {"action": "update_status", "front_id": front_id, "status": status, "note": note}
     if slot:
         payload["slot"] = slot
+    if cooldown_min:
+        payload["retry_after_minutes"] = cooldown_min
     res = gas(url, secret, payload)
     if not claim and res.get("error") == "conflict" and res.get("current") == status:
         return {"ok": True, "status": status}
@@ -231,7 +237,26 @@ def run(row, args, gas_url, gas_secret, token, slot):
             link = post_carousel.publish_carousel(
                 urls, caption, token, args.user_id,
                 before_publish=lambda: state.update(publishing=True))
-    except Exception as e:  # noqa: BLE001 失敗は必ず「エラー」にして止める
+    except RetryLater as e:
+        # 投稿されていないことが確か。この枠は使わずに「再試行待ち」へ戻し、次の実行で作り直す
+        note = f"再試行待ち: {e}"
+        if e.cooldown_min:
+            note += f"（{e.cooldown_min}分以上あけて再試行）"
+        print(f"::warning::{note}")
+        try:
+            res = set_status(gas_url, gas_secret, front_id, "再試行待ち", note[:400],
+                             cooldown_min=e.cooldown_min)
+        except PostError:
+            res = {}
+        if res.get("ok"):
+            return 0
+        print("[警告] 「再試行待ち」に更新できませんでした（Apps Script が古い可能性）。「エラー」にします。")
+        try:
+            set_status(gas_url, gas_secret, front_id, "エラー", note[:400])
+        except PostError:
+            print("[警告] 「エラー」への更新もできませんでした。行は「投稿中」のまま残ります。")
+        return 1
+    except Exception as e:  # noqa: BLE001 それ以外の失敗は必ず「エラー」にして止める
         note = f"失敗: {e}"
         if state["publishing"]:
             note += "（公開処理中の失敗。Instagramに投稿されていないか確認してください）"
@@ -289,6 +314,15 @@ def gate(gas_url, gas_secret, now=None):
         write_output("go", "false")
         print("::error::シートの受け口が「投稿枠」に対応していません。Apps Script を更新し、再デプロイしてください。")
         return 1
+    if not res.get("retry_supported"):
+        # 古い受け口は投稿予定日時が空の行もすぐ返し、「再試行待ち」も扱えない。必ず止める
+        write_output("go", "false")
+        print("::error::シートの受け口が「再試行待ち」に対応していません。Apps Script を更新し、再デプロイしてください。")
+        return 1
+    if res.get("cooldown_until"):
+        print(f"呼び出し上限のため、{res['cooldown_until']} までは投稿しません。")
+        write_output("go", "false")
+        return 0
     if res.get("slot_used"):
         print(f"この枠（{slot}）では、すでに投稿済みです。何もしません。")
         write_output("go", "false")
@@ -336,6 +370,12 @@ def main():
     if args.publish and args.scheduled and not res.get("slot_supported"):
         sys.exit("シートの受け口が「投稿枠」に対応していません。二重投稿を防げないため、投稿しません。"
                  "Apps Script を更新し、再デプロイしてください。")
+    if args.publish and not res.get("retry_supported"):
+        sys.exit("シートの受け口が「再試行待ち」に対応していません。投稿しません。"
+                 "Apps Script を更新し、再デプロイしてください。")
+    if res.get("cooldown_until"):
+        print(f"呼び出し上限のため、{res['cooldown_until']} までは投稿しません。")
+        return 0
     if res.get("slot_used"):
         print(f"この枠（{slot}）では、すでに投稿しています。何も投稿しません。")
         return 0
