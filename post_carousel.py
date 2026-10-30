@@ -17,8 +17,12 @@
 daily_post.py からは publish_carousel() を呼ぶ（失敗は PostError）。
   RetryLater は「まだ投稿されていない。次の実行でコンテナから作り直せばよい」失敗（再試行待ち）。
 
-API呼び出しの回数（1投稿）: コンテナ作成3 + 状態確認 最大5×3 + カルーセル作成1 + 状態確認 最大5
-  + 公開 最大3 + パーマリンク1 = 最少10回・最多28回。コンテナIDは保存せず、毎回作り直す。
+公開（media_publish）でエラーが出たときは、最近の投稿をキャプションで照合し、本当に投稿されたかを確かめる
+（403 を返しても実際は投稿されていたことがあるため）。投稿されていれば成功として扱う。
+
+API呼び出しの回数（1投稿）: 投稿前の確認1（daily_post.py）+ コンテナ作成3 + 状態確認 最大5×3
+  + カルーセル作成1 + 状態確認 最大5 + 公開 最大3 + 公開エラー時の確認 最大2 + パーマリンク1
+  = 最少11回・最多31回。コンテナIDは保存せず、毎回作り直す。
 """
 import argparse
 import json
@@ -35,6 +39,8 @@ MEDIA_NOT_READY_CODE = 9007  # Media ID is not available（公開できる状態
 STATUS_WAITS = (10, 10, 15, 20, 30)  # 状態確認の前に待つ秒数。確認は最大5回（合計85秒）
 PUBLISH_RETRY_WAITS = (30, 60)       # 公開が 9007 のとき、この間隔で最大2回やり直す
 RATE_LIMIT_COOLDOWN_MIN = 60         # 上限に達したら、少なくともこの分数は投稿しない
+VERIFY_WAITS = (20, 40)              # 公開でエラーが出たあと、投稿されたかを確かめる前に待つ秒数
+RECENT_MEDIA_LIMIT = 10              # 照合に使う最近の投稿の件数
 
 
 class PostError(Exception):
@@ -121,15 +127,46 @@ def wait_finished(container_id, token):
     raise RetryLater(f"コンテナの準備が {sum(STATUS_WAITS)} 秒で終わりませんでした: {container_id}")
 
 
+def find_published(caption, token, user_id="me"):
+    """最近の投稿から、キャプションが同じもの（空白の違いは無視）を探す。
+    見つかればパーマリンクを、なければ None を返す。"""
+    want = " ".join(caption.split())
+    r = call("GET", f"{user_id}/media", token,
+             {"fields": "caption,permalink,timestamp", "limit": RECENT_MEDIA_LIMIT})
+    for m in r.get("data", []):
+        if " ".join((m.get("caption") or "").split()) == want:
+            return m.get("permalink") or "(投稿を確認。パーマリンクは取得できませんでした)"
+    return None
+
+
+def confirm_after_failure(error, caption, token, user_id):
+    """公開でエラーが出たとき、本当に投稿されたかを確かめる。
+    投稿されていればパーマリンクを返す。見つからなければ、
+      - RetryLater（403 code 4 / 9007）… 投稿されていないことを確認できたので、そのまま再試行待ちにする
+      - それ以外 … 結果が分からないので「エラー」にして人が確認する
+    確認の呼び出し自体に失敗したときも「エラー」にする。"""
+    print(f"  公開でエラーが出ました。投稿されたかを確認します: {str(error)[:200]}")
+    for wait in VERIFY_WAITS:
+        time.sleep(wait)
+        try:
+            link = find_published(caption, token, user_id)
+        except PostError as e:
+            raise PostError(f"{error}（投稿されたかを確認できませんでした: {e}）") from error
+        if link:
+            print(f"  投稿されていました: {link}")
+            return f"{link} （APIはエラーを返したが、公開を確認）"
+    if isinstance(error, RetryLater):
+        raise error
+    raise PostError(f"{error}（投稿は見つかりませんでした。結果が分からないため確認してください）") from error
+
+
 def publish(container_id, token, user_id):
     """media_publish を呼ぶ。9007（まだ公開できない）のときだけ、間隔を空けてやり直す。
-    9007 は「公開されていない」という応答なので、やり直しても二重投稿にはならない。"""
+    9007 は「公開されていない」という応答なので、やり直しても二重投稿にはならない。
+    403 code 4 などの失敗は、そのまま呼び出し元へ（confirm_after_failure で投稿の有無を確かめる）。"""
     for wait in (*PUBLISH_RETRY_WAITS, None):
         try:
             return call("POST", f"{user_id}/media_publish", token, {"creation_id": container_id})
-        except RetryLater as e:
-            # 公開の呼び出しで上限に達した。公開されたか確かめられないため、人が確認する（エラー扱い）
-            raise PostError(f"{e}（公開の呼び出しで上限に達しました）") from e
         except ApiError as e:
             if e.code != MEDIA_NOT_READY_CODE and "Media ID is not available" not in str(e):
                 raise
@@ -161,7 +198,10 @@ def publish_carousel(urls, caption, token, user_id="me", before_publish=None):
 
     if before_publish:
         before_publish()
-    media_id = publish(parent, token, user_id)["id"]
+    try:
+        media_id = publish(parent, token, user_id)["id"]
+    except PostError as e:
+        return confirm_after_failure(e, caption, token, user_id)
     try:
         return call("GET", media_id, token, {"fields": "permalink"}).get("permalink", "(取得できませんでした)")
     except PostError:

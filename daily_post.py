@@ -13,6 +13,8 @@
 失敗時は「エラー」にして止まる。「投稿中」「エラー」の行は自動では再投稿されない。
 ただし、投稿されていないことが確かな失敗（403 code 4 の呼び出し上限、9007 の Media ID is not available、
 コンテナの準備待ちの時間切れ）は「再試行待ち」にして、次の実行でコンテナから作り直す。
+公開でエラーが出たときは、最近の投稿をキャプションで照合し、投稿されていれば「投稿済」にする。
+また、投稿を始める前にも毎回照合し、すでに同じ投稿があれば作り直さずに「投稿済」にする。
 上限に達したときは、受け口に「1時間は投稿しない」と伝える（その間はどの行も対象にならない）。
 
 使い方
@@ -202,6 +204,17 @@ def wait_public(urls, timeout=120):
 
 
 # ---------- 本体 ----------
+def already_published(caption, token, user_id):
+    """投稿を始める前に、同じキャプションの投稿がすでにあるかを確かめる（二重投稿の最後の防止策）。
+    確認できないときは、まだ何も投稿していないので「再試行待ち」にして次回やり直す。"""
+    try:
+        return post_carousel.find_published(caption, token, user_id)
+    except RetryLater:
+        raise
+    except PostError as e:
+        raise RetryLater(f"投稿前の確認ができませんでした: {e}") from e
+
+
 def run(row, args, gas_url, gas_secret, token, slot):
     front_id = row["front_id"]
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -228,15 +241,21 @@ def run(row, args, gas_url, gas_secret, token, slot):
     state = {"publishing": False}
     try:
         caption, tips = validate(row)
-        with tempfile.TemporaryDirectory() as td:
-            paths = build_images(row, tips, pathlib.Path(td))
-            push_temp_branch(paths, branch)
-            branched = True
-            urls = [f"https://raw.githubusercontent.com/{repo}/{branch}/{p.name}" for p in paths]
-            wait_public(urls)
-            link = post_carousel.publish_carousel(
-                urls, caption, token, args.user_id,
-                before_publish=lambda: state.update(publishing=True))
+        link = already_published(caption, token, args.user_id)
+        if link:
+            # 前回エラーのあとに遅れて公開されていた、など。作り直さずに「投稿済」にする（二重投稿の防止）
+            print(f"すでに公開されています。新しく投稿しません: {link}")
+            link += " （すでに公開済みだった）"
+        else:
+            with tempfile.TemporaryDirectory() as td:
+                paths = build_images(row, tips, pathlib.Path(td))
+                push_temp_branch(paths, branch)
+                branched = True
+                urls = [f"https://raw.githubusercontent.com/{repo}/{branch}/{p.name}" for p in paths]
+                wait_public(urls)
+                link = post_carousel.publish_carousel(
+                    urls, caption, token, args.user_id,
+                    before_publish=lambda: state.update(publishing=True))
     except RetryLater as e:
         # 投稿されていないことが確か。この枠は使わずに「再試行待ち」へ戻し、次の実行で作り直す
         note = f"再試行待ち: {e}"
